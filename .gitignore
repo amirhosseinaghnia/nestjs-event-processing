@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+coverage/
+
+# env / secrets
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+*.swp
+.DS_Store
+Thumbs.db
+
+# testcontainers
+.testcontainers/
