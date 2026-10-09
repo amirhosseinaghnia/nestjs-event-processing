@@ -1,16 +1,21 @@
-# Agent / Process Event Platform
+# NestJS Event Processing Platform
 
-Production-style NestJS monorepo for a take-home assignment: **Agent** services generate sensor-like events and publish them asynchronously; a **Process** service persists events, evaluates rules, stores historical matches, and exposes reporting APIs.
+A NestJS monorepo that ingests sensor-like events over RabbitMQ, evaluates threshold rules, stores historical matches, and exposes reporting APIs.
 
-## 1. Project overview
+**Agent** services generate and publish events asynchronously. The **Process** service persists events, matches rules, maintains Redis rankings, and serves HTTP APIs with Swagger.
 
-| Component | Role |
-|-----------|------|
-| `apps/agent` | Stateless event producer (~5 events/sec). No database. |
-| `apps/process` | Ingests events, rule CRUD, matching, Redis rankings, reports. |
-| `libs/shared` | Shared message contract, operators, pure rule evaluator. |
+## Features
 
-## 2. Architecture
+- Asynchronous event pipeline via RabbitMQ (durable queues, ack/nack, DLQ)
+- Rule CRUD with duplicate-active-rule protection (`409`)
+- Immutable rule snapshots on every match (explainable history after edit/delete)
+- Two reports: time-bounded occurrences and agent rankings
+- Idempotent processing for at-least-once delivery
+- Health and readiness probes
+- Docker Compose stack for local and demo deployments
+- Unit tests and Testcontainers-based e2e coverage
+
+## Architecture
 
 ```text
 ┌─────────────┐     EventMessageV1      ┌──────────────┐
@@ -32,146 +37,83 @@ Production-style NestJS monorepo for a take-home assignment: **Agent** services 
                     └─────────┘          └─────────┘
 ```
 
-## 3. Service responsibilities
+| Component | Role |
+|-----------|------|
+| `apps/agent` | Stateless event producer (~5 events/sec). No database. |
+| `apps/process` | Ingests events, rule CRUD, matching, Redis rankings, reports. |
+| `libs/shared` | Shared message contract, operators, pure rule evaluator. |
 
-### Agent
-- Configurable `AGENT_ID`
-- Generates typed numeric events with `@faker-js/faker`
-- Publishes durable AMQP messages (~5/sec)
-- Graceful shutdown stops the timer and closes the broker connection
+## Tech stack
 
-### Process
-- Consumes RabbitMQ with prefetch backpressure
-- Persists every event in MongoDB
-- Evaluates active rules; stores immutable rule snapshots on matches
-- Maintains Redis sorted-set rankings for Report #2
-- REST API for rules + reports; Swagger at `/docs`
+| Layer | Choice |
+|-------|--------|
+| Runtime | NestJS, TypeScript |
+| Broker | RabbitMQ |
+| Persistence | MongoDB (Mongoose) |
+| Cache / rankings | Redis (ioredis) |
+| Validation | class-validator, Joi (config) |
+| Docs | Swagger UI at `/docs` |
+| Tests | Jest, Testcontainers |
+| Ops | Docker Compose, multi-stage non-root images |
 
-## 4. Technology choices
+### Why RabbitMQ
 
-- **NestJS** — modular DI, lifecycle hooks, validation, Swagger
-- **MongoDB + Mongoose** — durable events / rules / matches
-- **Redis (ioredis)** — derived agent rankings per rule
-- **RabbitMQ** — async Agent → Process pipeline
-- **Jest + Testcontainers** — unit + isolated integration tests
-- **Docker Compose** — reproducible local stack
+| Option | Notes |
+|--------|-------|
+| HTTP / WebSocket | Synchronous coupling; poor fit for durable event fan-in |
+| Kafka | Strong at large scale; heavier operational footprint here |
+| Redis Streams | Mixes cache and broker concerns |
+| **RabbitMQ** | Durable queues, ack/nack, DLX/DLQ, Nest-friendly |
 
-## 5. Why RabbitMQ?
+## Quick start
 
-The assignment prefers a non-HTTP/WebSocket broker and suggests RabbitMQ unless there is a strong alternative.
+### Prerequisites
 
-| Option | Why not / why yes |
-|--------|-------------------|
-| HTTP / WebSocket | Explicitly disallowed for the event pipeline |
-| Kafka | Excellent at scale, heavier ops for a take-home |
-| Redis Streams | Blurs cache vs broker responsibilities |
-| **RabbitMQ** | Durable queues, ack/nack, DLX/DLQ, Nest-friendly, right complexity |
+- Node.js 20+
+- Docker / Docker Compose
 
-## 6. MongoDB schema
+### Full stack (recommended)
 
-### `events`
-| Field | Notes |
-|-------|-------|
-| `eventId` | UUID from Agent; unique |
-| `agentId`, `name`, `value` | Event payload |
-| `occurredAt` | Agent timestamp |
-| `receivedAt` | Server receive time |
-| `processingCompleted` | Idempotency / resume flag |
+```bash
+cp .env.example .env
+docker compose up --build
+```
 
-### `rules`
-| Field | Notes |
-|-------|-------|
-| `eventName` | Compared to `event.name` |
-| `operator` | `< > = <= >=` |
-| `threshold` | Numeric |
+| Service | URL |
+|---------|-----|
+| Process API | http://localhost:3000 |
+| Swagger | http://localhost:3000/docs |
+| RabbitMQ UI | http://localhost:15672 (`guest` / `guest`) |
 
-### `rule_matches`
-| Field | Notes |
-|-------|-------|
-| `eventId`, `agentId`, `ruleId` | Links |
-| `eventName`, `eventValue`, `occurredAt` | Event facts at match time |
-| `matchedAt` | Processing time |
-| `ruleSnapshot` | `{ eventName, operator, threshold }` frozen at match |
+Scale agents:
 
-Historical matches remain explainable after rule edit/delete.
+```bash
+docker compose up --build --scale agent=3
+```
 
-## 7. Important indexes
+Give each replica a distinct `AGENT_ID` via compose override if needed.
 
-| Collection | Index | Reason |
-|------------|-------|--------|
-| `events` | `{ eventId: 1 }` unique | Duplicate delivery |
-| `rules` | `{ eventName: 1 }` | Load rules for an event type |
-| `rules` | `{ eventName: 1, operator: 1, threshold: 1 }` unique | Prevent duplicate active rules |
-| `rule_matches` | `{ eventId: 1, ruleId: 1 }` unique | Idempotent matches / Redis gate |
-| `rule_matches` | `{ ruleId: 1, occurredAt: 1, agentId: 1 }` | Report #1 |
-| `rule_matches` | `{ ruleId: 1, agentId: 1 }` | Report #2 rebuild |
+### Local services (infra in Docker)
 
-## 8. Redis design
+```bash
+docker compose up -d mongo redis rabbitmq
 
-| Key | Structure | Purpose |
-|-----|-----------|---------|
-| `rule:{ruleId}:agent-counts` | Sorted set | `score=count`, `member=agentId` |
+cp .env.example .env   # point hosts to 127.0.0.1
 
-- Updated with `ZINCRBY` only after a **new** match insert
-- Deleted when a rule is deleted (matches remain in MongoDB)
-- No TTL — rebuildable derived state
-- On cache miss / Redis flush: aggregate MongoDB and rebuild
+npm install
+npm run start:process:dev
 
-MongoDB remains the durable source of truth.
+# separate terminal
+set AGENT_ID=agent-1
+set RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672
+npm run start:agent:dev
+```
 
-## 9. Rule matching flow
+On Unix shells, use `export` instead of `set`.
 
-1. Validate `EventMessageV1`
-2. Upsert event by `eventId`
-3. If `processingCompleted` → ack (true duplicate)
-4. Load active rules (short in-memory cache)
-5. Evaluate with pure `evaluateRule` / `findMatchingRules`
-6. Insert matches with snapshots; unique `(eventId, ruleId)`
-7. `ZINCRBY` only when match insert created a new doc
-8. Mark `processingCompleted = true`
-9. Ack
+## Configuration
 
-New/edited rules are **not** applied to past events.
-
-## 10. Idempotency strategy
-
-| Layer | Mechanism |
-|-------|-----------|
-| Transport | At-least-once AMQP; ack after success |
-| Event | Unique `eventId` + `processingCompleted` |
-| Match | Unique `(eventId, ruleId)` |
-| Redis | Increment only on new match insert |
-
-This covers: full duplicate delivery, crash after event insert (resume matching), and crash after match insert before Redis (Report #2 rebuild from Mongo).
-
-## 11. Consistency considerations
-
-- **MongoDB**: strong consistency for events/matches
-- **Redis rankings**: eventually consistent derived view
-- Report #2 prefers Redis, falls back to MongoDB aggregation + rebuild
-- Rule CRUD vs matching race: snapshot freezes the rule as evaluated; no global serializable clock across services (documented trade-off)
-
-## 12. API documentation
-
-Swagger UI: `http://localhost:3000/docs`
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/rules` | Create rule (`409` if an active rule with the same `eventName`, `operator`, and `threshold` already exists) |
-| GET | `/rules?page&limit` | Paginated list |
-| GET | `/rules/:id` | Get rule |
-| PATCH | `/rules/:id` | Update rule (`409` if the update would duplicate another active rule) |
-| DELETE | `/rules/:id` | Delete rule (hard delete; historical matches remain; an equivalent rule may be recreated) |
-| GET | `/reports/rules/:ruleId/occurrences?from&to` | Report #1 (max 1 day) |
-| GET | `/reports/rules/:ruleId/agent-rankings` | Report #2 |
-| GET | `/health` | Liveness |
-| GET | `/health/ready` | Mongo + Redis + Rabbit readiness |
-
-Reports work for deleted rules if historical matches exist.
-
-## 13. Environment variables
-
-See [`.env.example`](.env.example).
+See [`.env.example`](.env.example). Config is validated with Joi at startup. Do not commit `.env`.
 
 | Variable | Service | Required | Description |
 |----------|---------|----------|-------------|
@@ -184,110 +126,96 @@ See [`.env.example`](.env.example).
 | `RABBITMQ_PREFETCH` | Process | no (10) | Consumer prefetch |
 | `LOG_LEVEL` | both | no (`log`) | Nest log level |
 
-Configuration is validated with Joi at startup (fail fast). Do not commit `.env`.
+## API
 
-## 14. Local development
+Swagger UI: http://localhost:3000/docs
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/rules` | Create rule (`409` on duplicate active rule) |
+| `GET` | `/rules?page&limit` | Paginated list |
+| `GET` | `/rules/:id` | Get rule |
+| `PATCH` | `/rules/:id` | Update rule (`409` on duplicate) |
+| `DELETE` | `/rules/:id` | Hard delete (historical matches remain) |
+| `GET` | `/reports/rules/:ruleId/occurrences?from&to` | Occurrences in a range (max 1 day) |
+| `GET` | `/reports/rules/:ruleId/agent-rankings` | Agent rankings for a rule |
+| `GET` | `/health` | Liveness |
+| `GET` | `/health/ready` | Mongo + Redis + Rabbit readiness |
+
+Reports remain available for deleted rules when historical matches exist.
+
+## Data model
+
+### Collections
+
+**`events`** — `eventId` (unique UUID), `agentId`, `name`, `value`, `occurredAt`, `receivedAt`, `processingCompleted`
+
+**`rules`** — `eventName`, `operator` (`< > = <= >=`), `threshold`
+
+**`rule_matches`** — links (`eventId`, `agentId`, `ruleId`), event facts, `matchedAt`, and `ruleSnapshot` `{ eventName, operator, threshold }` frozen at match time
+
+### Indexes
+
+| Collection | Index | Purpose |
+|------------|-------|---------|
+| `events` | `{ eventId: 1 }` unique | Deduplicate delivery |
+| `rules` | `{ eventName: 1 }` | Load rules by event type |
+| `rules` | `{ eventName: 1, operator: 1, threshold: 1 }` unique | Prevent duplicate active rules |
+| `rule_matches` | `{ eventId: 1, ruleId: 1 }` unique | Idempotent matches |
+| `rule_matches` | `{ ruleId: 1, occurredAt: 1, agentId: 1 }` | Occurrences report |
+| `rule_matches` | `{ ruleId: 1, agentId: 1 }` | Rankings rebuild |
+
+### Redis
+
+| Key | Structure | Purpose |
+|-----|-----------|---------|
+| `rule:{ruleId}:agent-counts` | Sorted set | `score=count`, `member=agentId` |
+
+Updated with `ZINCRBY` only after a new match insert. Deleted when a rule is deleted (Mongo matches remain). Rebuildable from MongoDB on cache miss.
+
+## Processing pipeline
+
+1. Validate `EventMessageV1`
+2. Upsert event by `eventId`
+3. If `processingCompleted` → ack (duplicate)
+4. Load active rules (short in-memory cache)
+5. Evaluate with pure `evaluateRule` / `findMatchingRules`
+6. Insert matches with snapshots; unique `(eventId, ruleId)`
+7. `ZINCRBY` only when a new match document is created
+8. Mark `processingCompleted = true`
+9. Ack
+
+New or edited rules are not applied to past events.
+
+### Idempotency
+
+| Layer | Mechanism |
+|-------|-----------|
+| Transport | At-least-once AMQP; ack after success |
+| Event | Unique `eventId` + `processingCompleted` |
+| Match | Unique `(eventId, ruleId)` |
+| Redis | Increment only on new match insert |
+
+MongoDB is the durable source of truth. Redis rankings are an eventually consistent derived view; Report rankings prefer Redis and fall back to Mongo aggregation + rebuild.
+
+## Development
 
 ```bash
-# Infrastructure only
-docker compose up -d mongo redis rabbitmq
-
-# Terminal 1 — Process
-cp .env.example .env   # adjust hosts to 127.0.0.1
 npm install
 npm run start:process:dev
-
-# Terminal 2 — Agent
-set AGENT_ID=agent-1
-set RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5672
 npm run start:agent:dev
-```
 
-## 15. Docker instructions
-
-```bash
-docker compose up --build
-```
-
-- Process API: http://localhost:3000  
-- Swagger: http://localhost:3000/docs  
-- RabbitMQ UI: http://localhost:15672 (`guest` / `guest`)
-
-Scale agents:
-
-```bash
-docker compose up --build --scale agent=3
-```
-
-(Give each replica a distinct `AGENT_ID` via override if needed.)
-
-Images use multi-stage builds and run as non-root.
-
-## 16. Running tests
-
-```bash
-npm test            # unit tests
-npm run test:cov    # coverage
-npm run lint
 npm run build process
 npm run build agent
-```
-
-## 17. Integration test instructions
-
-E2E tests use **Testcontainers** for MongoDB and Redis. Docker must be running. RabbitMQ is stubbed in the Nest test module; the consumer business path is exercised via `EventProcessorService.processEvent` (identical logic to the AMQP handler) so tests stay deterministic without requiring broker image pulls.
-
-```bash
+npm run lint
+npm test
+npm run test:cov
 npm run test:e2e
 ```
 
-Covered scenarios include rule CRUD/pagination, multi-match events, no-match, non-retroactive rules, snapshot after edit, reports after delete, duplicate delivery, Redis rebuild, and 1-day range validation. Full broker wiring is exercised in Docker Compose.
+E2E tests use Testcontainers for MongoDB and Redis (Docker required). RabbitMQ is stubbed in the Nest test module; the consumer path runs through `EventProcessorService.processEvent` for deterministic coverage. Full broker wiring is exercised via Docker Compose.
 
-## 18. Performance considerations
-
-- Prefetch limits in-flight work (backpressure)
-- Compound index for Report #1 keeps day-bounded queries efficient
-- Report #2 is O(agents with matches) via Redis ZSET
-- Rule evaluation is O(rules for event name); short in-memory cache
-- Horizontal Process scaling is safe due to unique indexes
-- Event retention/TTL left as a future improvement for very long-lived deployments
-
-## 19. Known trade-offs
-
-1. Redis rankings can briefly undercount if a crash happens between match insert and `ZINCRBY` — corrected on read via Mongo rebuild.
-2. Hard-deleted rules leave matches intact; Redis key is removed.
-3. No multi-document Mongo transaction across event + matches — uniqueness provides practical idempotency.
-4. In-memory rule cache may be stale for a few seconds after CRUD.
-5. Numeric `=` uses exact equality (documented assumption).
-
-## 20. Possible future improvements
-
-- Event TTL / cold storage archival
-- Explicit rule version collection (if audit needs more than snapshots)
-- Metrics (Prometheus) and tracing (OpenTelemetry)
-- Outbox pattern if Process must publish downstream events
-- Authentication if APIs leave a trusted network
-
-## Assumptions
-
-- Event `value` is numeric
-- All rules in the `rules` collection are active
-- No authentication (not required by the assignment)
-- Agent-generated UUIDs are trusted for identity; Process still validates payload shape and uniqueness
-
-## Project structure
-
-```text
-apps/agent/          # producer
-apps/process/        # consumer + API
-libs/shared/         # contracts + pure domain helpers
-Dockerfile.agent
-Dockerfile.process
-docker-compose.yml
-.env.example
-```
-
-## Scripts
+### Scripts
 
 | Script | Purpose |
 |--------|---------|
@@ -295,3 +223,32 @@ docker-compose.yml
 | `build` / `build:process` / `build:agent` | Compile |
 | `lint` / `format` | Quality |
 | `test` / `test:e2e` / `test:cov` | Tests |
+
+## Project structure
+
+```text
+apps/agent/          # event producer
+apps/process/        # consumer + HTTP API
+libs/shared/         # contracts + pure domain helpers
+Dockerfile.agent
+Dockerfile.process
+docker-compose.yml
+.env.example
+```
+
+## Design notes
+
+- Prefetch limits in-flight work (backpressure)
+- Horizontal Process scaling is safe thanks to unique indexes
+- Redis rankings can briefly undercount if a crash occurs between match insert and `ZINCRBY`; corrected on read via Mongo rebuild
+- In-memory rule cache may lag CRUD by a few seconds
+- Numeric `=` uses exact equality
+- Event `value` is numeric; agent-generated UUIDs are validated for shape and uniqueness
+
+### Possible extensions
+
+- Event TTL / cold storage archival
+- Explicit rule versioning beyond match snapshots
+- Prometheus metrics and OpenTelemetry tracing
+- Outbox pattern for downstream publishing
+- Authentication for untrusted networks
