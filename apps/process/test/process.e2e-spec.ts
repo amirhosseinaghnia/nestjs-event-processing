@@ -148,6 +148,192 @@ describe('Process service (e2e)', () => {
         .get(`/rules/${created._id}`)
         .expect(404);
     });
+
+    it('rejects creating an exact duplicate active rule with 409', async () => {
+      await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      const duplicate = await request(app.getHttpServer())
+        .post('/rules')
+        .send({
+          eventName: 'temperature',
+          operator: '>',
+          threshold: 80,
+        })
+        .expect(409);
+
+      expect(duplicate.body).toMatchObject({
+        statusCode: 409,
+        error: 'Conflict',
+        message:
+          'An active rule with the same eventName, operator, and threshold already exists',
+      });
+      expect(duplicate.body).not.toEqual(
+        expect.objectContaining({ message: expect.stringMatching(/E11000/i) }),
+      );
+      expect(await ruleModel.countDocuments()).toBe(1);
+    });
+
+    it('allows rules that differ only by operator or threshold', async () => {
+      await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      await createRule({
+        eventName: 'temperature',
+        operator: '>=',
+        threshold: 80,
+      });
+
+      await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 90,
+      });
+
+      expect(await ruleModel.countDocuments()).toBe(3);
+    });
+
+    it('rejects an update that would duplicate another active rule', async () => {
+      const ruleA = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+      const ruleB = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 90,
+      });
+
+      const conflict = await request(app.getHttpServer())
+        .patch(`/rules/${ruleB._id}`)
+        .send({ threshold: 80 })
+        .expect(409);
+
+      expect(conflict.body.statusCode).toBe(409);
+      expect(conflict.body.error).toBe('Conflict');
+      expect(conflict.body.message).not.toMatch(/E11000/i);
+
+      const unchanged = await request(app.getHttpServer())
+        .get(`/rules/${ruleB._id}`)
+        .expect(200);
+      expect(unchanged.body.threshold).toBe(90);
+      expect(ruleA._id).not.toBe(ruleB._id);
+    });
+
+    it('allows a rule to update without conflicting with itself', async () => {
+      const rule = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      const updated = await request(app.getHttpServer())
+        .patch(`/rules/${rule._id}`)
+        .send({ eventName: 'temperature', operator: '>', threshold: 80 })
+        .expect(200);
+
+      expect(updated.body._id).toBe(rule._id);
+      expect(updated.body.threshold).toBe(80);
+      expect(await ruleModel.countDocuments()).toBe(1);
+    });
+
+    it('allows recreating an equivalent rule after hard delete', async () => {
+      const created = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      await request(app.getHttpServer())
+        .delete(`/rules/${created._id}`)
+        .expect(204);
+
+      const recreated = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      expect(recreated._id).not.toBe(created._id);
+      expect(await ruleModel.countDocuments()).toBe(1);
+    });
+
+    it('preserves historical matches after rule deletion and allows recreate', async () => {
+      const rule = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+
+      const message = createEventMessageV1({
+        eventId: uuidv4(),
+        agentId: 'agent-1',
+        name: 'temperature',
+        value: 85,
+      });
+      await processor.processEvent(message);
+
+      expect(
+        await matchModel.countDocuments({
+          ruleId: new Types.ObjectId(rule._id),
+        }),
+      ).toBe(1);
+
+      await request(app.getHttpServer())
+        .delete(`/rules/${rule._id}`)
+        .expect(204);
+
+      expect(
+        await matchModel.countDocuments({
+          ruleId: new Types.ObjectId(rule._id),
+        }),
+      ).toBe(1);
+
+      const recreated = await createRule({
+        eventName: 'temperature',
+        operator: '>',
+        threshold: 80,
+      });
+      expect(recreated._id).not.toBe(rule._id);
+      expect(
+        await matchModel.countDocuments({
+          ruleId: new Types.ObjectId(rule._id),
+        }),
+      ).toBe(1);
+    });
+
+    it('handles concurrent creates of the same rule with at most one persisted', async () => {
+      const body = {
+        eventName: 'temperature',
+        operator: '>' as const,
+        threshold: 80,
+      };
+
+      const results = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          request(app.getHttpServer()).post('/rules').send(body),
+        ),
+      );
+
+      const created = results.filter((res) => res.status === 201);
+      const conflicts = results.filter((res) => res.status === 409);
+
+      expect(created).toHaveLength(1);
+      expect(conflicts).toHaveLength(7);
+      expect(await ruleModel.countDocuments()).toBe(1);
+      for (const conflict of conflicts) {
+        expect(conflict.body.statusCode).toBe(409);
+        expect(conflict.body.error).toBe('Conflict');
+        expect(String(conflict.body.message)).not.toMatch(/E11000/i);
+      }
+    });
   });
 
   describe('Event processing', () => {

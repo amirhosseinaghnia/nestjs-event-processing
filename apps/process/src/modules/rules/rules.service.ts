@@ -1,10 +1,23 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { RankingCacheService } from '../../infrastructure/redis/ranking-cache.service';
 import { CreateRuleDto } from './dto/create-rule.dto';
 import { UpdateRuleDto } from './dto/update-rule.dto';
 import { RuleDocument, RuleEntity } from './rule.schema';
+
+function isDuplicateKeyError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code?: number }).code === 11000
+  );
+}
 
 @Injectable()
 export class RulesService {
@@ -24,9 +37,18 @@ export class RulesService {
   }
 
   async create(dto: CreateRuleDto): Promise<RuleDocument> {
-    const rule = await this.ruleModel.create(dto);
-    this.invalidateCache();
-    return rule;
+    try {
+      const rule = await this.ruleModel.create(dto);
+      this.invalidateCache();
+      return rule;
+    } catch (error) {
+      if (isDuplicateKeyError(error)) {
+        throw new ConflictException(
+          'An active rule with the same eventName, operator, and threshold already exists',
+        );
+      }
+      throw error;
+    }
   }
 
   async findAll(
@@ -74,14 +96,26 @@ export class RulesService {
     if (!Types.ObjectId.isValid(id)) {
       throw new NotFoundException(`Rule ${id} not found`);
     }
-    const rule = await this.ruleModel
-      .findByIdAndUpdate(id, { $set: dto }, { new: true })
-      .exec();
-    if (!rule) {
-      throw new NotFoundException(`Rule ${id} not found`);
+    try {
+      const rule = await this.ruleModel
+        .findByIdAndUpdate(id, { $set: dto }, { new: true })
+        .exec();
+      if (!rule) {
+        throw new NotFoundException(`Rule ${id} not found`);
+      }
+      this.invalidateCache();
+      return rule;
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw error;
+      }
+      if (isDuplicateKeyError(error)) {
+        throw new ConflictException(
+          'An active rule with the same eventName, operator, and threshold already exists',
+        );
+      }
+      throw error;
     }
-    this.invalidateCache();
-    return rule;
   }
 
   async remove(id: string): Promise<void> {

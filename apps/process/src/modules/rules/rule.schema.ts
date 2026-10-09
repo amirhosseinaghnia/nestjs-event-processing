@@ -21,3 +21,7 @@ export class RuleEntity {
 
 export const RuleSchema = SchemaFactory.createForClass(RuleEntity);
 RuleSchema.index({ eventName: 1 });
+RuleSchema.index(
+  { eventName: 1, operator: 1, threshold: 1 },
+  { unique: true },
+);

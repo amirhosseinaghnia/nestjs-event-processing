@@ -101,6 +101,7 @@ Historical matches remain explainable after rule edit/delete.
 |------------|-------|--------|
 | `events` | `{ eventId: 1 }` unique | Duplicate delivery |
 | `rules` | `{ eventName: 1 }` | Load rules for an event type |
+| `rules` | `{ eventName: 1, operator: 1, threshold: 1 }` unique | Prevent duplicate active rules |
 | `rule_matches` | `{ eventId: 1, ruleId: 1 }` unique | Idempotent matches / Redis gate |
 | `rule_matches` | `{ ruleId: 1, occurredAt: 1, agentId: 1 }` | Report #1 |
 | `rule_matches` | `{ ruleId: 1, agentId: 1 }` | Report #2 rebuild |
@@ -156,11 +157,11 @@ Swagger UI: `http://localhost:3000/docs`
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/rules` | Create rule |
+| POST | `/rules` | Create rule (`409` if an active rule with the same `eventName`, `operator`, and `threshold` already exists) |
 | GET | `/rules?page&limit` | Paginated list |
 | GET | `/rules/:id` | Get rule |
-| PATCH | `/rules/:id` | Update rule |
-| DELETE | `/rules/:id` | Delete rule |
+| PATCH | `/rules/:id` | Update rule (`409` if the update would duplicate another active rule) |
+| DELETE | `/rules/:id` | Delete rule (hard delete; historical matches remain; an equivalent rule may be recreated) |
 | GET | `/reports/rules/:ruleId/occurrences?from&to` | Report #1 (max 1 day) |
 | GET | `/reports/rules/:ruleId/agent-rankings` | Report #2 |
 | GET | `/health` | Liveness |
